@@ -422,6 +422,7 @@ int n64_rom_tx(const char* name, unsigned char index) {
 	char md5_hex[40];
 	uint64_t bootcode_sum = 0;
 	char cart_id[8];
+	bool is_sm64 = false;
 
 	while (bytes2send)
 	{
@@ -480,6 +481,18 @@ int n64_rom_tx(const char* name, unsigned char index) {
 			strncpy(cart_id, (char*)(buf + 0x3b), 4);
 			sprintf((char*)(cart_id + 4), "%02X", buf[0x3f]);
 			printf("Cartridge ID: %s\n", cart_id);
+			if (strncmp(cart_id + 1, "SM", 2) == 0) {
+				printf("Detected Super Mario 64\n");
+				is_sm64 = true;
+			}
+		}
+		else if (is_sm64) {
+			for (uint32_t i = 0; i < chunk / sizeof(uint32_t); i++) {
+				if (((uint32_t*)buf)[i] == UINT32_C(0x78000014)) {
+					printf("Found a face at address 0x%07x\n", i * sizeof(uint32_t));
+					((uint32_t*)buf)[i] = UINT32_C(0x0c020014);
+				}
+			}
 		}
 
 		user_io_file_tx_data(buf, chunk);
