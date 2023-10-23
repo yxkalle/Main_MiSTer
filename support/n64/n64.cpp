@@ -45,13 +45,14 @@ enum class CIC {
 	CIC_NUS_8303,
 	CIC_NUS_8401,
 	CIC_NUS_5167,
-	CIC_NUS_DDUS
+	CIC_NUS_DDUS,
+        CIC_NUS_5101,
 };
 
 enum class SystemType {
 	UNKNOWN = -1,
 	NTSC,
-	PAL
+	PAL,
 };
 
 enum class RomFormat {
@@ -157,6 +158,7 @@ static bool parse_and_apply_db_tags(char* tags) {
 			case fnv_hash("cic8401"): cic = CIC::CIC_NUS_8401; break;
 			case fnv_hash("cic5167"): cic = CIC::CIC_NUS_5167; break;
 			case fnv_hash("cicDDUS"): cic = CIC::CIC_NUS_DDUS; break;
+			case fnv_hash("cic5101"): cic = CIC::CIC_NUS_5101; break;
 			default: printf("Unknown tag: %s\n", tag); break;
 		}
 	}
