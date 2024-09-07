@@ -2186,7 +2186,7 @@ static void joy_analog(int dev, int axis, int offset, int stick = 0)
 		{
 			// Emulate N64 joystick range and shape for regular -127-+127 controllers
 			n64_joy_emu(x, y, &x, &y, input[dev].max_cardinal[stick], input[dev].max_range[stick]);
-			stick_swap(num, stick, &num, &stick);
+			stick_swap(&num, &stick);
 		}
 
 		if (stick)

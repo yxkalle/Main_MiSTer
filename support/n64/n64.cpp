@@ -39,13 +39,16 @@ static constexpr auto AUTOPAK_OPT = "[81]";
 static constexpr auto PATCHES_OPT = "[90]";
 static constexpr auto CHEATS_OPT = "[103]";
 static constexpr const char* const CONTROLLER_OPTS[] = { "[51:49]", "[54:52]", "[57:55]", "[60:58]" };
+static constexpr const size_t CONTROLLER_COUNT = sizeof(CONTROLLER_OPTS) / sizeof(*CONTROLLER_OPTS);
 
-// Simple hash function, see: https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
+// Simple FNV-1a hash function, see: https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
 // (Modified to make it case-insensitive)
 static constexpr uint64_t FNV_PRIME = 0x100000001b3;
 static constexpr uint64_t FNV_OFFSET_BASIS = 0xcbf29ce484222325;
-static constexpr uint64_t fnv_hash(const char* s, uint64_t h = FNV_OFFSET_BASIS) {
-	if (s) while (uint8_t a = *(s++)) h = (h ^ ((a >= 'A') && (a <= 'Z') ? a + ('a' - 'A') : a)) * FNV_PRIME;
+static constexpr uint64_t fnv_hash(const char* str, uint64_t h = FNV_OFFSET_BASIS) {
+	for (char c = *str; c; c = *(++str)) {
+		h = (h ^ ((c >= 'A') && (c <= 'Z') ? c + ('a' - 'A') : c)) * FNV_PRIME;
+	}
 	return h;
 }
 
@@ -56,9 +59,8 @@ enum class MemoryType : uint32_t {
 	SRAM_32k,
 	SRAM_96k,
 	FLASH_128k,
-	CPAK = ~2U,
-	TPAK = ~1U,
-	UNKNOWN = ~0U
+	CPAK = ~1U,
+	TPAK = ~0U
 };
 
 enum class CIC : uint32_t {
@@ -142,6 +144,27 @@ struct patch_data {
 	bool turbo_core_only;
 };
 
+static size_t get_save_size(MemoryType v) {
+	switch (v) {
+	case MemoryType::EEPROM_512: return 0x200;
+	case MemoryType::EEPROM_2k: return 0x800;
+	case MemoryType::SRAM_32k: return 0x8000;
+	case MemoryType::SRAM_96k: return 0x18000;
+	case MemoryType::FLASH_128k: return 0x20000;
+	case MemoryType::CPAK:
+	case MemoryType::TPAK: return 0x8000; // 32 KiByte
+	default: return 0;
+	}
+}
+
+static PadType get_pad_type(size_t player) {
+	return (PadType)user_io_status_get(CONTROLLER_OPTS[player]);
+}
+
+static void set_pad_type(size_t player, PadType type) {
+	user_io_status_set(CONTROLLER_OPTS[player], (uint32_t)type);
+}
+
 static uint8_t loaded = 0;
 static char current_rom_path[1024] = { '\0' };
 static char current_rom_path_gb[1024] = { '\0' };
@@ -151,6 +174,7 @@ static cheat_code* cheat_codes = nullptr;
 static uint32_t cheat_codes_count = 0;
 static patch_data patches[256];
 static int is_turbo_core_type = 0;
+static bool tpak;
 
 static const char* stringify(MemoryType v) {
 	switch (v) {
@@ -162,19 +186,6 @@ static const char* stringify(MemoryType v) {
 	case MemoryType::CPAK: return "CPAK DATA";
 	case MemoryType::TPAK: return "TPAK DATA";
 	default: return "(none)";
-	}
-}
-
-static size_t get_save_size(MemoryType v) {
-	switch (v) {
-	case MemoryType::EEPROM_512: return 0x200;
-	case MemoryType::EEPROM_2k: return 0x800;
-	case MemoryType::SRAM_32k: return 0x8000;
-	case MemoryType::SRAM_96k: return 0x18000;
-	case MemoryType::FLASH_128k: return 0x20000;
-	case MemoryType::CPAK:
-	case MemoryType::TPAK: return 0x8000; // 32 KiByte
-	default: return 0;
 	}
 }
 
@@ -300,7 +311,7 @@ static uint32_t get_save_offset(unsigned char idx) {
 		idx--;
 	}
 
-	if (idx && (bool)user_io_status_get(TPAK_OPT)) {
+	if (idx && user_io_status_get(TPAK_OPT)) {
 		offset += get_save_size(MemoryType::TPAK);
 		idx--;
 	}
@@ -407,13 +418,13 @@ struct N64SaveFile {
 			return false;
 		}
 
-		auto sz = this->get_size();
+		size_t sz = this->get_size(), file_sz;
 		memset(save_file_buf, 0, sz);
 		bool found_old_data = false;
 
 		if (sz && FileExists(old_path, 0)) {
 			uint32_t off = get_save_offset((this->idx < 0) ? mounted_save_files : this->idx);
-			if (read_file(old_path, save_file_buf, off, sz)) {
+			if ((file_sz = read_file(old_path, save_file_buf, off, sz)) && (file_sz == sz)) {
 				printf("Found old save data \"%s\", converting to %s.\n", old_path, stringify(type));
 				found_old_data = true;
 				if ((this->type == MemoryType::CPAK) || (this->type == MemoryType::TPAK)) {
@@ -554,36 +565,64 @@ static void trim(char* out, size_t max_len, const char* str)
 	}
 }
 
+static void update_controller_settings(bool rpak, bool cpak) {
+	user_io_status_set(CPAK_OPT, cpak);
+	user_io_status_set(RPAK_OPT, rpak);
+
+	if (get_pad_type(0) == PadType::N64_PAD_WITH_CPAK) {
+		user_io_status_set(TPAK_OPT, 0);
+		user_io_status_set(CPAK_OPT, cpak);
+	}
+	else {
+		user_io_status_set(TPAK_OPT, tpak);
+	}
+
+	for (size_t i = 1; i < CONTROLLER_COUNT; i++) {
+		if (get_pad_type(i) == PadType::N64_PAD_WITH_CPAK) {
+			user_io_status_set(CPAK_OPT, cpak);
+			break;
+		}
+	}
+}
+
+static void update_controller_settings() {
+	bool rpak = user_io_status_get(RPAK_OPT),
+	     cpak = user_io_status_get(CPAK_OPT);
+
+	update_controller_settings(rpak, cpak);
+}
+
 // Returns true if CIC and System Region is detected, or if auto-detection is turned off
-static bool parse_and_apply_db_tags(char* tags) {
-	if (!tags) return false;
+static uint8_t parse_and_apply_db_tags(char* tags) {
+	if (!tags) return 0;
 
 	const char* separator = "| ";
 	MemoryType save_type = MemoryType::NONE;
 	SystemType system_type = SystemType::UNKNOWN;
 	CIC cic_type = CIC::UNKNOWN;
-	bool no_epak = false;
-	bool cpak = false;
-	bool rpak = false;
-	bool tpak = false;
-	bool rtc = false;
+	PadType 
+		prefered_pad_type_p1 = PadType::N64_PAD,
+		prefered_pad_type_p234 = PadType::N64_PAD;
+	bool 
+		no_epak = false,
+		cpak = false,
+		rpak = false,
+		rtc = false,
+		probably_pal = false;
+	patch_data* patch = patches;
 	int p_match;
 	uint32_t p_addr, p_diff;
-	char p_tag;
-
-	PadType prefered_pad = PadType::N64_PAD;
-
-	patch_data* patch = patches;
+	char p_type;
 
 	for (char* tag = strtok(tags, separator); tag; tag = strtok(nullptr, separator)) {
 		// Patch tag
-		if ((p_match = sscanf(tag, "%*[Pp]%8x:%8x%*[:]%c", &p_addr, &p_diff, &p_tag)) >= 2) {
+		if ((p_match = sscanf(tag, "%*[Pp]%8x:%8x%*[:]%c", &p_addr, &p_diff, &p_type)) >= 2) {
 			printf("Patch: 0x%08x:0x%08x", p_addr, p_diff);
-			if (p_match >= 3) printf(":%c", p_tag);
+			if (p_match >= 3) printf(":%c", p_type);
 			printf("\n");
 			patch->address = p_addr;
 			patch->diff = p_diff;
-			patch->turbo_core_only = p_match >= 3 && (p_tag == 'T' || p_tag == 't');
+			patch->turbo_core_only = p_match >= 3 && (p_type == 'T' || p_type == 't');
 			patch++;
 			continue;
 		}
@@ -595,22 +634,39 @@ static bool parse_and_apply_db_tags(char* tags) {
 		case fnv_hash("sram96k"): save_type = MemoryType::SRAM_96k; break;
 		case fnv_hash("flash128k"): save_type = MemoryType::FLASH_128k; break;
 		case fnv_hash("noepak"): no_epak = true; break;
-		case fnv_hash("cpak"): cpak = true; if (prefered_pad == PadType::N64_PAD) prefered_pad = PadType::N64_PAD_WITH_CPAK; break;
-		case fnv_hash("rpak"): rpak = true; if (prefered_pad == PadType::N64_PAD) prefered_pad = PadType::N64_PAD_WITH_RPAK; break;
-		case fnv_hash("tpak"): tpak = true; if (prefered_pad == PadType::N64_PAD) prefered_pad = PadType::N64_PAD_WITH_TPAK; break;
+		case fnv_hash("cpak"): 
+			cpak = true; 
+			if (prefered_pad_type_p1 == PadType::N64_PAD) {
+				prefered_pad_type_p1 = prefered_pad_type_p234 = PadType::N64_PAD_WITH_CPAK;
+			}
+			break;
+		case fnv_hash("rpak"): 
+			rpak = true; 
+			if (prefered_pad_type_p1 == PadType::N64_PAD) {
+				prefered_pad_type_p1 = PadType::N64_PAD_WITH_RPAK;
+			}
+			if ((prefered_pad_type_p234 == PadType::N64_PAD) || (prefered_pad_type_p234 == PadType::N64_PAD_WITH_CPAK)) {
+				prefered_pad_type_p234 = PadType::N64_PAD_WITH_RPAK;
+			}
+			break;
+		case fnv_hash("tpak"): 
+			tpak = true; 
+			if (prefered_pad_type_p1 == PadType::N64_PAD) 
+				prefered_pad_type_p1 = PadType::N64_PAD_WITH_TPAK; 
+			break;
 		case fnv_hash("rtc"): rtc = true; break;
-		case fnv_hash("ntsc"): ntsc: system_type = SystemType::NTSC; break;
-		case fnv_hash("pal"): pal: system_type = SystemType::PAL; break;
-		case fnv_hash("cic6101"): cic_type = CIC::CIC_NUS_6101; goto ntsc;
-		case fnv_hash("cic6102"): cic_type = CIC::CIC_NUS_6102; goto ntsc;
-		case fnv_hash("cic6103"): cic_type = CIC::CIC_NUS_6103; goto ntsc;
-		case fnv_hash("cic6105"): cic_type = CIC::CIC_NUS_6105; goto ntsc;
-		case fnv_hash("cic6106"): cic_type = CIC::CIC_NUS_6106; goto ntsc;
-		case fnv_hash("cic7101"): cic_type = CIC::CIC_NUS_7101; goto pal;
-		case fnv_hash("cic7102"): cic_type = CIC::CIC_NUS_7102; goto pal;
-		case fnv_hash("cic7103"): cic_type = CIC::CIC_NUS_7103; goto pal;
-		case fnv_hash("cic7105"): cic_type = CIC::CIC_NUS_7105; goto pal;
-		case fnv_hash("cic7106"): cic_type = CIC::CIC_NUS_7106; goto pal;
+		case fnv_hash("ntsc"): system_type = SystemType::NTSC; break;
+		case fnv_hash("pal"): system_type = SystemType::PAL; break;
+		case fnv_hash("cic6101"): cic_type = CIC::CIC_NUS_6101; break;
+		case fnv_hash("cic6102"): cic_type = CIC::CIC_NUS_6102; break;
+		case fnv_hash("cic6103"): cic_type = CIC::CIC_NUS_6103; break;
+		case fnv_hash("cic6105"): cic_type = CIC::CIC_NUS_6105; break;
+		case fnv_hash("cic6106"): cic_type = CIC::CIC_NUS_6106; break;
+		case fnv_hash("cic7101"): cic_type = CIC::CIC_NUS_7101; probably_pal = true; break;
+		case fnv_hash("cic7102"): cic_type = CIC::CIC_NUS_7102; probably_pal = true; break;
+		case fnv_hash("cic7103"): cic_type = CIC::CIC_NUS_7103; probably_pal = true; break;
+		case fnv_hash("cic7105"): cic_type = CIC::CIC_NUS_7105; probably_pal = true; break;
+		case fnv_hash("cic7106"): cic_type = CIC::CIC_NUS_7106; probably_pal = true; break;
 		case fnv_hash("cic8303"): cic_type = CIC::CIC_NUS_8303; break;
 		case fnv_hash("cic8401"): cic_type = CIC::CIC_NUS_8401; break;
 		case fnv_hash("cic5167"): cic_type = CIC::CIC_NUS_5167; break;
@@ -621,7 +677,7 @@ static bool parse_and_apply_db_tags(char* tags) {
 	}
 
 	if (system_type == SystemType::UNKNOWN && cic_type != CIC::UNKNOWN) {
-		system_type = SystemType::NTSC;
+		system_type = probably_pal ? SystemType::PAL : SystemType::NTSC;
 	}
 
 	printf("Region: %s, Save Type: %s, CIC: %s, CPak: %s, RPak: %s, TPak %s, RTC: %s, Mem: %uMiB\n",
@@ -636,7 +692,7 @@ static bool parse_and_apply_db_tags(char* tags) {
 
 	if (!is_auto()) {
 		printf("Auto-detect is OFF, not updating OSD settings.\n");
-		return true;
+		return 1;
 	}
 
 	printf("Auto-detect is ON, updating OSD settings.\n");
@@ -644,18 +700,33 @@ static bool parse_and_apply_db_tags(char* tags) {
 	if (system_type != SystemType::UNKNOWN) user_io_status_set(SYS_TYPE_OPT, (uint32_t)system_type);
 	if (cic_type != CIC::UNKNOWN) user_io_status_set(CIC_TYPE_OPT, (uint32_t)cic_type);
 
-	user_io_status_set(NO_EPAK_OPT, (uint32_t)no_epak);
-	user_io_status_set(CPAK_OPT, (uint32_t)cpak);
-	user_io_status_set(RPAK_OPT, (uint32_t)rpak);
-	user_io_status_set(TPAK_OPT, (uint32_t)tpak);
-	user_io_status_set(RTC_OPT, (uint32_t)rtc);
+	user_io_status_set(NO_EPAK_OPT, no_epak);
+	user_io_status_set(RTC_OPT, rtc);
 	set_cart_save_type(save_type);
 
-	if (is_autopak() && ((PadType)user_io_status_get(CONTROLLER_OPTS[0]) != PadType::SNAC)) {
-		user_io_status_set(CONTROLLER_OPTS[0], (uint32_t)prefered_pad);
+	if (is_autopak()) {
+		for (size_t i = 0; i < CONTROLLER_COUNT; i++) {
+			PadType pad_type = get_pad_type(i), prefered_pad_type;
+			if (pad_type == PadType::SNAC) continue;
+			if ((i > 0) && pad_type == PadType::UNPLUGGED) continue;
+			prefered_pad_type = i == 0 ? prefered_pad_type_p1 : prefered_pad_type_p234;
+			if (pad_type != prefered_pad_type) {
+				if ((i == 0) && (save_type == MemoryType::NONE) && cpak && (prefered_pad_type == PadType::N64_PAD_WITH_CPAK)) {
+					set_pad_type(0, PadType::N64_PAD_WITH_CPAK);
+				}
+				else if (!(rpak && (pad_type == PadType::N64_PAD_WITH_RPAK)) &&
+				         !(cpak && (pad_type == PadType::N64_PAD_WITH_CPAK)) &&
+				         !(tpak && (pad_type == PadType::N64_PAD_WITH_TPAK))) {
+					set_pad_type(i, prefered_pad_type);
+				}
+
+			}
+		}
 	}
 
-	return (system_type != SystemType::UNKNOWN && cic_type != CIC::UNKNOWN);
+	update_controller_settings(rpak, cpak);
+
+	return (system_type != SystemType::UNKNOWN) && (cic_type != CIC::UNKNOWN) ? 1 : 0;
 }
 
 static bool md5_matches(const char* line, const char* md5) {
@@ -717,7 +788,7 @@ static uint8_t detect_rom_settings_in_db(const char* lookup_hash, const char* db
 		printf("Found ROM entry for MD5 %s: [%s]\n", lookup_hash, tags);
 
 		// 2 = System region and/or CIC wasn't in DB, will need further detection
-		return parse_and_apply_db_tags(tags) ? 3 : 2;
+		return parse_and_apply_db_tags(tags) | 2;
 	}
 
 	return 0;
@@ -748,7 +819,7 @@ static uint8_t detect_rom_settings_in_db_with_cartid(const char* cart_id, const 
 		printf("Found ROM entry for ID [%s]: \"%s\".\n", cart_id, tags);
 
 		// 2 = System region and/or CIC wasn't in DB, will need further detection
-		return parse_and_apply_db_tags(tags) ? 3 : 2;
+		return parse_and_apply_db_tags(tags) | 2;
 	}
 
 	return 0;
@@ -829,43 +900,41 @@ static bool detect_homebrew_header(const uint8_t* controller_settings, const cha
 
 	printf("Auto-detect is ON, updating OSD settings.\n");
 
-	user_io_status_set(RTC_OPT, (uint32_t)(hex_to_dec(cart_id[5]) & 1)); // RTC
+	user_io_status_set(RTC_OPT, hex_to_dec(cart_id[5]) & 1); // RTC
 
-	user_io_status_set(RPAK_OPT, (uint32_t)(
+	user_io_status_set(RPAK_OPT,
 		(controller_settings[0] == 0x01) ||
 		(controller_settings[1] == 0x01) ||
 		(controller_settings[2] == 0x01) ||
-		(controller_settings[3] == 0x01) ? 1 : 0)); // Rumble Pak
+		(controller_settings[3] == 0x01) ? 1 : 0); // Rumble Pak
 
-	user_io_status_set(CPAK_OPT, (uint32_t)(
+	user_io_status_set(CPAK_OPT,
 		(controller_settings[0] == 0x02) ||
 		(controller_settings[1] == 0x02) ||
 		(controller_settings[2] == 0x02) ||
-		(controller_settings[3] == 0x02) ? 1 : 0)); // Controller Pak
+		(controller_settings[3] == 0x02) ? 1 : 0); // Controller Pak
 
-	user_io_status_set(TPAK_OPT, (uint32_t)(
+	user_io_status_set(TPAK_OPT,
 		(controller_settings[0] == 0x03) ||
 		(controller_settings[1] == 0x03) ||
 		(controller_settings[2] == 0x03) ||
-		(controller_settings[3] == 0x03) ? 1 : 0)); // Transfer Pak
+		(controller_settings[3] == 0x03) ? 1 : 0); // Transfer Pak
 
 	if (!is_autopak()) return true;
 
-	size_t c_idx = 0;
-	for (auto c_opt : CONTROLLER_OPTS) {
-		if (controller_settings[c_idx] && ((PadType)user_io_status_get(c_opt) != PadType::SNAC)) {
+	for (size_t c_idx = 0; c_idx < CONTROLLER_COUNT; c_idx++) {
+		if (controller_settings[c_idx] && (get_pad_type(c_idx) != PadType::SNAC)) {
 			if (controller_settings[c_idx] < 0x80) {
-				user_io_status_set(c_opt, (uint32_t)(
+				set_pad_type(c_idx,
 					(controller_settings[c_idx] == 0x01) ? PadType::N64_PAD_WITH_RPAK :
 					(controller_settings[c_idx] == 0x02) ? PadType::N64_PAD_WITH_CPAK :
 					(controller_settings[c_idx] == 0x03) && (c_idx == 0) ? PadType::N64_PAD_WITH_TPAK :
-					PadType::N64_PAD));
+					PadType::N64_PAD);
 			}
 			else if (controller_settings[c_idx] == 0xff) {
-				user_io_status_set(c_opt, (uint32_t)PadType::UNPLUGGED);
+				set_pad_type(c_idx, PadType::UNPLUGGED);
 			}
 		}
-		c_idx++;
 	}
 
 	return true;
@@ -1164,25 +1233,31 @@ static void get_old_save_path(char* save_path) {
 }
 
 void n64_load_savedata(uint64_t lba, int ack, uint64_t& buffer_lba, uint8_t* buffer, uint32_t buffer_size, uint32_t blksz, uint32_t sz) {
-	int invalid = 0;
-	int done = 0;
+	bool invalid = false, done = false;
 	unsigned char file_idx = 0;
 	int64_t pos = lba * blksz;
 	N64SaveFile* save_file;
+	fileTYPE* image;
 
-	do {
+	while(1) {
 		if ((file_idx >= mounted_save_files) || !(save_file = save_files[file_idx]) || !save_file->is_mounted()) {
 			buffer_lba = -1;
-			invalid = 1;
+			invalid = true;
 			break;
 		}
 		if (pos < get_save_offset(file_idx + 1)) {
 			break;
 		}
 		file_idx++;
-	} while (1);
+	}
 
-	fileTYPE* image;
+	size_t pak_offset = (get_cart_save_type() != MemoryType::NONE) ? 1 : 0;
+
+	if (!invalid && (file_idx >= pak_offset)) {
+		PadType pad_type = get_pad_type(file_idx - pak_offset);
+		invalid &= !((pad_type == PadType::N64_PAD_WITH_CPAK) || (pad_type == PadType::N64_PAD_WITH_TPAK));
+	}
+
 	if (!invalid && (image = save_file->get_image()) && image->size) {
 		diskled_on();
 		pos -= get_save_offset(file_idx);
@@ -1195,15 +1270,9 @@ void n64_load_savedata(uint64_t lba, int ack, uint64_t& buffer_lba, uint8_t* buf
 				// Pad block that wasn't filled completely
 				memset(buffer + read_sz, 0, sz - read_sz);
 			}
-			done = 1;
+			done = true;
 			buffer_lba = lba;
 		}
-	}
-
-	// Even after error we have to provide the block to the core
-	// Give an empty block.
-	if (!done || invalid) {
-		memset(buffer, 0, buffer_size);
 	}
 
 	// Data is now stored in buffer. Send it to fpga
@@ -1211,6 +1280,12 @@ void n64_load_savedata(uint64_t lba, int ack, uint64_t& buffer_lba, uint8_t* buf
 	spi_w(UIO_SECTOR_RD | ack);
 	spi_block_write(buffer, user_io_get_width(), sz);
 	DisableIO();
+
+	// Even after error we have to provide the block to the core
+	// Give an empty block.
+	if (!done || invalid) {
+		memset(buffer, 0, buffer_size);
+	}
 
 	if (done && ((pos + blksz) >= image->size)) {
 		printf("Loaded save data from \"%s\". (%lld bytes)\n", get_image_name(file_idx), image->size);
@@ -1227,7 +1302,7 @@ void n64_save_savedata(uint64_t lba, int ack, uint64_t& buffer_lba, uint8_t* buf
 	int64_t pos = lba * blksz;
 	N64SaveFile* save_file;
 
-	do {
+	while (1) {
 		if ((file_idx >= mounted_save_files) || !(save_file = save_files[file_idx]) || !save_file->is_mounted()) {
 			invalid = 1;
 			break;
@@ -1236,7 +1311,9 @@ void n64_save_savedata(uint64_t lba, int ack, uint64_t& buffer_lba, uint8_t* buf
 			break;
 		}
 		file_idx++;
-	} while (1);
+	}
+
+	PadType pad_type = get_pad_type(file_idx);
 
 	// Fetch sector data from FPGA ...
 	EnableIO();
@@ -1244,7 +1321,7 @@ void n64_save_savedata(uint64_t lba, int ack, uint64_t& buffer_lba, uint8_t* buf
 	spi_block_read(buffer, user_io_get_width(), sz);
 	DisableIO();
 
-	if (invalid) {
+	if (invalid || !((pad_type == PadType::N64_PAD_WITH_CPAK) || (pad_type == PadType::N64_PAD_WITH_TPAK))) {
 		return;
 	}
 
@@ -1280,10 +1357,10 @@ static void mount_all_saves() {
 		mount_save(cart_save_type, old_save_path);
 	}
 
-	auto use_cpak = (bool)user_io_status_get(CPAK_OPT);
+	bool use_cpak = user_io_status_get(CPAK_OPT);
 
 	// First controller can be either tpak or cpak. Tpak is prioritized.
-	if ((bool)user_io_status_get(TPAK_OPT)) {
+	if (user_io_status_get(TPAK_OPT)) {
 		mount_save_gb(old_save_path);
 	}
 	else if (use_cpak) {
@@ -1382,6 +1459,9 @@ static unsigned long poll_timer = 0;
 
 void n64_reset() {
 	printf("Resetting N64...\n");
+
+	update_controller_settings();
+
 	if (cheat_codes && cheats_loaded() && cheats_enabled()) {
 		for (uint32_t i = 0; i < cheat_codes_count; i++) {
 			cheat_codes[i].flags.is_boot_code_executed = false;
@@ -1532,17 +1612,19 @@ int n64_rom_tx(const char* name, unsigned char idx, uint32_t load_addr, uint32_t
 	/* 0 = Nothing detected
 	   1 = System region and CIC detected
 	   2 = Found some ROM info in DB (Save type etc.), but System region and/or CIC has not been determined
-	   3 = Has detected everything, System type, CIC, Save type etc. */
+	   3 = Has detected everything, System type, CIC, Save type etc.
+	   5, 6, 7 = Same as 1, 2, 3, but tpak was detected */
 	uint8_t rom_settings_detected = 0;
 	ByteOrder rom_endianness;
 	uint8_t md5[MD5_LENGTH];
 	char md5_hex[MD5_LENGTH * 2 + 1];
 	uint64_t bootcode_sums[2] = { };
-	uint8_t controller_settings[4] = { };
+	uint8_t controller_settings[CONTROLLER_COUNT] = { };
 	bool is_first_chunk = true;
 	char cart_id[CARTID_LENGTH + 1] = { };
 	char internal_name[20 + 1];
 
+	tpak = false;
 	memset(patches, 0, sizeof(patches));
 
 	// CRC32 is used for cheat look-up
@@ -1738,11 +1820,10 @@ int n64_rom_tx(const char* name, unsigned char idx, uint32_t load_addr, uint32_t
 	}
 	else {
 		auto save_type = get_cart_save_type();
-		auto no_epak = (bool)user_io_status_get(NO_EPAK_OPT);
-		auto tpak = (bool)user_io_status_get(TPAK_OPT);
-		auto cpak = (bool)user_io_status_get(CPAK_OPT);
-		auto rpak = (bool)user_io_status_get(RPAK_OPT);
-		auto rtc = (bool)user_io_status_get(RTC_OPT);
+		bool no_epak = user_io_status_get(NO_EPAK_OPT),
+		     cpak = user_io_status_get(CPAK_OPT),
+		     rpak = user_io_status_get(RPAK_OPT),
+		     rtc = user_io_status_get(RTC_OPT);
 
 		if (save_type != MemoryType::NONE) len += sprintf(info + len, "\nSave Type: %s", stringify(save_type));
 		if (tpak) len += sprintf(info + len, "\nTransfer Pak \x96");

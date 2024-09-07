@@ -15,7 +15,6 @@
 #include "hardware.h"
 #include "osd.h"
 #include "user_io.h"
-#include "debug.h"
 #include "spi.h"
 #include "cfg.h"
 #include "input.h"
